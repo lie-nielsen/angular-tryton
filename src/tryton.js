@@ -56,7 +56,7 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
         // Handle the cases where the response is an error.
         // The __error__ attribute is set by the response Transformer
         var error = angular.copy(response.data);
-        if (error[0] == 'NotLogged') {
+        if ((error[0] == 'NotLogged') || (error[0].slice(0, 13) == '403 Forbidden')) {
           /**
            * @ngdoc event
            * @name tryton:NotLogged
@@ -71,6 +71,7 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
            *  Depending on the application, it could decide to logoff the user
            *  or show a lock screen and ask for the password again to refresh
            *  the login by calling `session.doLogin`.
+           *  Fulfil seems to with '403 Forbidden:' instead of 'Not Logged'.
            *
            *  Example:
            *
@@ -82,7 +83,7 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
            *
            */
           $rootScope.$broadcast('tryton:NotLogged');
-        } else if (error[0] == 'UserError') {
+        } else if (error[0] == 'UserError')  {
           /**
            * @ngdoc event
            * @name tryton:UserError
@@ -217,10 +218,10 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
                 response.result[recordKey][fieldKey] = field.decimal;
                 break;
               case 'datetime':
-                response.result[recordKey][fieldKey] = new Date(Date.UTC(field.year, field.month - 1, field.day,
+                response.result[recordKey][fieldKey] = new Date(field.year, field.month - 1, field.day,
                                                                 field.hour, field.minute,
                                                                 field.second, field.microsecond/1000
-                                                               )).toUTCString();
+                                                               ).toUTCString();
                 break;
               case 'date':
                 // Get dateFormat from user preferences otherwise show in ISO format.
@@ -291,11 +292,7 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
       Stores the URL of the RPC server to which the connection has to be
       made.
   **/
-  this.serverUrl = $localStorage.serverUrl || '/';
-
-  this.setServerUrl = function(url) {
-    tryton.serverUrl = $localStorage.serverUrl = url + (url.slice(-1)==='/' ? '' : '/');
-  };
+  this.baseserverUrl = 'https://lie-nielsen.fulfil.io/';
 
   /**
     @ngdoc method
@@ -348,12 +345,16 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
         </file>
       </example>
   **/
-  this.rpc = function(method, params, database) {
+  this.rpc = function(method, params, sessionId) {
     var request = $http.post(
-      tryton.serverUrl + (database || ''),
+      tryton.baseserverUrl,
       {
         'method': method,
         'params': params || []
+      },
+      { 
+        'headers' : {'Authorization': 'Session ' + sessionId
+                    }
       }
     );
     return request;
@@ -529,11 +530,10 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
     @param {string} sessionId The Session ID of the current session (issued by
                               tryton server).
   **/
-  this.setSession = function(_database, _login, _userId, _sessionId) {
-    $localStorage.database = _database || null;
+  this.setSession = function(_login, _userId, _sessionId) {
     $localStorage.login = _login || null;
     $localStorage.userId = _userId || null;
-    $sessionStorage.sessionId = _sessionId || null;
+    $sessionStorage.sessionId = btoa([_login,_userId.toString(),_sessionId].join(':'));
 
     // Now that everything is stored to localStorage/sessionStorage, reuse the loadAllFromStorage
     // method to load values into variables here.
@@ -590,7 +590,7 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
     // session and the database in the session
 
     // Construct parameters: [userId, sessionId, param1, param2,... context]
-    var params = [session.userId, session.sessionId].concat((_params || []));
+    var params = _params || [];
 
     var requestContext = angular.copy((session.context || {}));
     if (_context !== undefined) {
@@ -598,7 +598,7 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
     }
     params.push(requestContext);
 
-    return tryton.rpc(_method, params, session.database);
+    return tryton.rpc(_method, params, this.sessionId);
   };
 
   /**
@@ -623,20 +623,19 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
     session.loadAllFromStorage();
   };
 
-  var _tryLogin = function(_database, _username, _password) {
+  var _tryLogin = function(_username, _password) {
     // call login on tryton server and if the login is succesful set the
     // userId and session
     var deferred = $q.defer();
-    tryton.rpc( 'common.login', [_username, _password], _database)
-     .success(function(result) {
+    tryton.rpc( 'common.db.login', [_username, _password])
+     .then(function(result) {
        // Since trytond returns an Array with userId and sessionId on successful
        // login and an error Object on error; false if bad credentials.
-       if (result instanceof Array) {
-         session.setSession(_database, _username, result[0], result[1]);
+       if (result.data instanceof Array) {
+         session.setSession(_username, result.data[0], result.data[1]);
        }
        deferred.resolve(result);
-     })
-     .error(function(reason) {
+     } ,function(reason) {
        deferred.reject(reason);
      });
     return deferred.promise;
@@ -658,58 +657,24 @@ angular.module('openlabs.angular-tryton', ['ngStorage'])
 
     @returns {Promise} Promise that will be resolved on successful response.
   **/
-  this.doLogin = function(_database, _username, _password, getPreferences) {
+  this.doLogin = function(_username, _password) {
     // `loginDeferred` checks for login success/error
     var loginDeferred = $q.defer();
     // Even if user has been successfully logged in, failing to `getPreferences`
     // (if true) should make the call to `doLogin` failed as a whole, which is
     // done in `finalDeferred`.
     var finalDeferred = $q.defer();
-
-    var urlRegex = /^https?:\/\//i;
     var loginPromise;
-    // Make sure URL has http or https in it.
-    if(urlRegex.test(tryton.serverUrl) || tryton.serverUrl === '/') {
-      loginPromise = _tryLogin(_database, _username, _password);
-    } else {
-      // If URL doesn't have protocol, try https first then http.
-      tryton.setServerUrl('https://' + tryton.serverUrl);
-      loginPromise = loginDeferred.promise;
-      _tryLogin(_database, _username, _password)
-        .then(function(result){
-          loginDeferred.resolve(result);
-        }, function(reason){
-          if(!reason) {
-            // Couldn't login, try again with http.
-            tryton.setServerUrl(
-              tryton.serverUrl.replace(/^https/i, 'http')
-            );
-            _tryLogin(_database, _username, _password)
-              .then(function(result){
-                loginDeferred.resolve(result);
-              }, function(reason){
-                loginDeferred.reject(reason);
-              });
-          } else {
-            loginDeferred.reject(reason);
-          }
-        });
-    }
-
+    loginPromise = _tryLogin(_username, _password);
     // Get the user preferences if user has asked for it.
     loginPromise.then(function(loginResponse) {
-      if(!getPreferences) {
-        finalDeferred.resolve(loginResponse);
-      } else {
-        session.rpc('model.res.user.get_preferences', true)
-          .success(function(preferences) {
-            session.setDefaultContext(preferences);
+        session.rpc('model.res.user.get_preferences', [true])
+          .then(function(preferences) {
+            session.setDefaultContext(preferences.result);
             finalDeferred.resolve(loginResponse);
-          })
-          .error(function(reason) {
+          } ,function(reason) {
             finalDeferred.reject(reason);
           });
-      }
     }, function(reason) {
       finalDeferred.reject(reason);
     });
